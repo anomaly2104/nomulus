@@ -16,9 +16,11 @@ package google.registry.util;
 
 import static com.google.common.truth.Truth.assertThat;
 import static google.registry.util.DomainNameUtils.canonicalizeHostname;
+import static google.registry.util.DomainNameUtils.checkValidFqdn;
 import static google.registry.util.DomainNameUtils.getSecondLevelDomain;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import com.google.common.collect.ImmutableList;
 import org.junit.jupiter.api.Test;
 
 /** Unit tests for {@link DomainNameUtils}. */
@@ -105,5 +107,30 @@ class DomainNameUtilsTest {
     IllegalArgumentException thrown =
         assertThrows(IllegalArgumentException.class, () -> getSecondLevelDomain("foo.bar", "abc"));
     assertThat(thrown).hasMessageThat().isEqualTo("hostName must be under the tld");
+  }
+
+  @Test
+  void testCheckValidFqdn_succeeds() {
+    assertThat(checkValidFqdn("  EPP.Example.COM. ")).isEqualTo("epp.example.com");
+    assertThat(checkValidFqdn("epp.みんな")).isEqualTo("epp.xn--q9jyb4c");
+    assertThat(checkValidFqdn("xn--q9jyb4c.registrar.example"))
+        .isEqualTo("xn--q9jyb4c.registrar.example");
+    assertThat(checkValidFqdn("a".repeat(63) + ".example")).isEqualTo("a".repeat(63) + ".example");
+  }
+
+  @Test
+  void testCheckValidFqdn_rejectsInvalid() {
+    for (String invalid :
+        ImmutableList.of(
+            "",
+            "epp",
+            "epp.",
+            "*.registrar.example",
+            "192.0.2.1",
+            "epp_1.registrar.example",
+            "-epp.registrar.example",
+            "a".repeat(64) + ".example")) {
+      assertThrows(IllegalArgumentException.class, () -> checkValidFqdn(invalid));
+    }
   }
 }

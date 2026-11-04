@@ -18,6 +18,7 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static google.registry.util.PreconditionsUtils.checkArgumentNotNull;
 
 import com.google.common.base.Ascii;
+import com.google.common.base.CharMatcher;
 import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
@@ -31,6 +32,10 @@ public final class DomainNameUtils {
   /** Prefix for unicode domain name parts. */
   public static final String ACE_PREFIX = "xn--";
   public static final String ACE_PREFIX_REGEX = "^xn--";
+
+  /** Strict validator for ASCII lowercase letters, digits, and "-", allowing "." as a separator. */
+  public static final CharMatcher ALLOWED_CHARS =
+      CharMatcher.inRange('a', 'z').or(CharMatcher.inRange('0', '9').or(CharMatcher.anyOf("-.")));
 
   /** Checks whether "name" is a strict subdomain of "potentialParent". */
   public static boolean isUnder(InternetDomainName name, InternetDomainName potentialParent) {
@@ -69,6 +74,37 @@ public final class DomainNameUtils {
     }
     sb.append(Idn.tldToASCII(parts.getLast())).append(finalChar);
     return sb.toString();
+  }
+
+  /**
+   * Returns the canonical form of a plain fully qualified DNS hostname, or throws {@link
+   * IllegalArgumentException}.
+   *
+   * <p>The canonical form is trimmed, lowercased, in A-label (punycode) form and without a trailing
+   * dot. A valid name has at least two labels made of ASCII letters, digits and hyphens, each label
+   * 1 to 63 characters long and not starting or ending with a hyphen, and is at most 253 characters
+   * in total. Wildcards, IP addresses, schemes, ports and paths are rejected.
+   */
+  public static String checkValidFqdn(String hostname) {
+    checkArgumentNotNull(hostname, "Hostname cannot be null");
+    String canonical;
+    try {
+      canonical = canonicalizeHostname(hostname.trim());
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException(
+          String.format("Not a valid fully qualified hostname: %s", hostname), e);
+    }
+    if (canonical.endsWith(".")) {
+      canonical = canonical.substring(0, canonical.length() - 1);
+    }
+    checkArgument(
+        !canonical.isEmpty()
+            && ALLOWED_CHARS.matchesAllOf(canonical)
+            && InternetDomainName.isValid(canonical)
+            && InternetDomainName.from(canonical).parts().size() >= 2,
+        "Not a valid fully qualified hostname: %s",
+        hostname);
+    return canonical;
   }
 
   /**

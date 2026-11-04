@@ -66,8 +66,10 @@ import google.registry.persistence.converter.CidrBlockListUserType;
 import google.registry.persistence.converter.CurrencyToStringMapUserType;
 import google.registry.persistence.transaction.TransactionManager;
 import google.registry.util.CidrAddressBlock;
+import google.registry.util.DomainNameUtils;
 import google.registry.util.PasswordUtils;
 import google.registry.util.PasswordUtils.HashAlgorithm;
+import google.registry.util.X509Utils;
 import jakarta.mail.internet.AddressException;
 import jakarta.mail.internet.InternetAddress;
 import jakarta.persistence.AttributeOverride;
@@ -185,6 +187,12 @@ public class Registrar extends UpdateAutoTimestampEntity implements Buildable, J
   /** Regex for E.164 phone number format. */
   private static final Pattern E164_PATTERN = Pattern.compile("\\+[0-9]{1,3}\\.[0-9]{1,14}");
 
+  /** Maximum number of hostnames in the EPP client certificate allowlist. */
+  public static final int MAX_EPP_CLIENT_CERTIFICATE_HOSTNAMES = 20;
+
+  /** Maximum number of revoked client certificate hashes. */
+  public static final int MAX_REVOKED_CLIENT_CERTIFICATE_HASHES = 20;
+
   /** Regex for telephone support passcode (5 digit string). */
   public static final Pattern PHONE_PASSCODE_PATTERN = Pattern.compile("\\d{5}");
 
@@ -294,6 +302,23 @@ public class Registrar extends UpdateAutoTimestampEntity implements Buildable, J
 
   /** Base64 encoded SHA256 hash of {@link #failoverClientCertificate}. */
   String failoverClientCertificateHash;
+
+  /**
+   * Hostnames for which a client certificate issued by a publicly trusted CA is accepted at EPP
+   * login, as an alternative to the pinned {@link #clientCertificate}.
+   *
+   * <p>Entries are stored in the canonical form produced by {@link DomainNameUtils#checkValidFqdn}.
+   * They are only consulted while the {@code ALLOW_EPP_CLIENT_CERT_HOSTNAME_AUTH} feature flag is
+   * active.
+   */
+  @Expose Set<String> allowedEppClientCertificateHostnames;
+
+  /**
+   * Base64 encoded SHA256 hashes of client certificates the registrar has revoked, in the same form
+   * as {@link #clientCertificateHash}. A certificate with one of these hashes is rejected at EPP
+   * login regardless of which mechanism would otherwise have accepted it.
+   */
+  @Expose Set<String> revokedClientCertificateHashes;
 
   /** An allow list of netmasks (in CIDR notation) which the client is allowed to connect from. */
   @org.hibernate.annotations.Type(CidrBlockListUserType.class)
@@ -540,6 +565,14 @@ public class Registrar extends UpdateAutoTimestampEntity implements Buildable, J
     return nullToEmptyImmutableCopy(ipAddressAllowList);
   }
 
+  public ImmutableSortedSet<String> getAllowedEppClientCertificateHostnames() {
+    return nullToEmptyImmutableSortedCopy(allowedEppClientCertificateHostnames);
+  }
+
+  public ImmutableSortedSet<String> getRevokedClientCertificateHashes() {
+    return nullToEmptyImmutableSortedCopy(revokedClientCertificateHashes);
+  }
+
   public RegistrarAddress getLocalizedAddress() {
     return localizedAddress;
   }
@@ -662,6 +695,9 @@ public class Registrar extends UpdateAutoTimestampEntity implements Buildable, J
         .put("clientCertificateHash", clientCertificateHash)
         .put("failoverClientCertificate", failoverClientCertificate)
         .put("failoverClientCertificateHash", failoverClientCertificateHash)
+        .putListOfStrings(
+            "allowedEppClientCertificateHostnames", getAllowedEppClientCertificateHostnames())
+        .putListOfStrings("revokedClientCertificateHashes", getRevokedClientCertificateHashes())
         .put("localizedAddress", localizedAddress)
         .put("internationalizedAddress", internationalizedAddress)
         .put("phoneNumber", phoneNumber)
@@ -850,6 +886,43 @@ public class Registrar extends UpdateAutoTimestampEntity implements Buildable, J
     public Builder setLastPocVerificationDate(Instant now) {
       checkArgumentNotNull(now, "Registrar lastPocVerificationDate cannot be null");
       getInstance().lastPocVerificationDate = now;
+      return this;
+    }
+
+    /**
+     * Sets the hostnames for which CA-issued client certificates are accepted at EPP login.
+     *
+     * <p>Each entry is canonicalized and validated by {@link DomainNameUtils#checkValidFqdn};
+     * duplicates collapse to one entry.
+     */
+    public Builder setAllowedEppClientCertificateHostnames(Iterable<String> hostnames) {
+      checkArgumentNotNull(hostnames, "EPP client certificate hostnames cannot be null");
+      ImmutableSortedSet<String> validated =
+          stream(hostnames)
+              .map(DomainNameUtils::checkValidFqdn)
+              .collect(toImmutableSortedSet(Comparator.naturalOrder()));
+      checkArgument(
+          validated.size() <= MAX_EPP_CLIENT_CERTIFICATE_HOSTNAMES,
+          "At most %s EPP client certificate hostnames may be configured, got %s",
+          MAX_EPP_CLIENT_CERTIFICATE_HOSTNAMES,
+          validated.size());
+      getInstance().allowedEppClientCertificateHostnames = validated;
+      return this;
+    }
+
+    /** Sets the hashes of client certificates that are rejected at EPP login. */
+    public Builder setRevokedClientCertificateHashes(Iterable<String> hashes) {
+      checkArgumentNotNull(hashes, "revoked client certificates cannot be null");
+      ImmutableSortedSet<String> validated =
+          stream(hashes)
+              .map(X509Utils::checkValidCertificateHash)
+              .collect(toImmutableSortedSet(Comparator.naturalOrder()));
+      checkArgument(
+          validated.size() <= MAX_REVOKED_CLIENT_CERTIFICATE_HASHES,
+          "At most %s revoked client certificates may be configured, got %s",
+          MAX_REVOKED_CLIENT_CERTIFICATE_HASHES,
+          validated.size());
+      getInstance().revokedClientCertificateHashes = validated;
       return this;
     }
 

@@ -15,13 +15,16 @@
 package google.registry.util;
 
 import static com.google.common.base.MoreObjects.firstNonNull;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Throwables.throwIfInstanceOf;
 import static com.google.common.collect.MoreCollectors.onlyElement;
 import static com.google.common.io.BaseEncoding.base64;
+import static google.registry.util.PreconditionsUtils.checkArgumentNotNull;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.common.hash.Hashing;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -66,6 +69,30 @@ public final class X509Utils {
     } catch (CertificateException | NoSuchAlgorithmException e) {
       throw new IllegalArgumentException(e);
     }
+  }
+
+  /**
+   * Verifies that the given string has the form of a certificate hash as produced by {@link
+   * #getCertificateHash}, i.e. an unpadded base64 encoding of a SHA-256 digest, and returns it
+   * trimmed.
+   */
+  public static String checkValidCertificateHash(String hash) {
+    checkArgumentNotNull(hash, "Certificate hash cannot be null");
+    String trimmed = hash.trim();
+    byte[] decoded;
+    try {
+      decoded = base64().omitPadding().decode(trimmed);
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException(
+          String.format("Not a base64 encoded SHA-256 certificate hash: %s", hash), e);
+    }
+    checkArgument(
+        !trimmed.contains("=")
+            && decoded.length == Hashing.sha256().bits() / Byte.SIZE
+            && base64().omitPadding().encode(decoded).equals(trimmed),
+        "Not a base64 encoded SHA-256 certificate hash: %s",
+        hash);
+    return trimmed;
   }
 
   /**
