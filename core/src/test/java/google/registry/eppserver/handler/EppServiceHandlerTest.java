@@ -16,6 +16,8 @@ package google.registry.eppserver.handler;
 
 import static com.google.common.truth.Truth.assertThat;
 import static google.registry.eppserver.handler.EppServiceHandler.REMOTE_ADDRESS_KEY;
+import static google.registry.networking.handler.SslServerInitializer.CLIENT_CERTIFICATE_CHAIN_VALIDATED_KEY;
+import static google.registry.networking.handler.SslServerInitializer.CLIENT_CERTIFICATE_HOSTNAMES_KEY;
 import static google.registry.networking.handler.SslServerInitializer.CLIENT_CERTIFICATE_PROMISE_KEY;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.mockito.ArgumentMatchers.any;
@@ -29,6 +31,8 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableList;
 import google.registry.eppserver.metric.FrontendMetrics;
 import google.registry.eppserver.quota.EppServerQuotaManager;
 import google.registry.eppserver.quota.LocalConnectionLimiter;
@@ -54,6 +58,8 @@ import java.net.SocketAddress;
 import java.security.cert.X509Certificate;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
+import java.util.stream.IntStream;
+import javax.annotation.Nullable;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -448,5 +454,183 @@ class EppServiceHandlerTest {
 
     // Verify it logged error and closed connection
     verify(ctx).close();
+  }
+
+  @SuppressWarnings("unchecked")
+  private ArgumentCaptor<FakeHttpServletRequest> setUpHandshakeWithChainAttrs(
+      @Nullable Boolean chainValidated, @Nullable ImmutableList<String> hostnames)
+      throws Exception {
+    certPromise = new DefaultPromise<>(ImmediateEventExecutor.INSTANCE);
+    when(channel.attr(CLIENT_CERTIFICATE_PROMISE_KEY)).thenReturn(certPromiseAttr);
+    when(certPromiseAttr.get()).thenReturn(certPromise);
+
+    if (chainValidated != null) {
+      Attribute<Boolean> chainValidatedAttr = mock(Attribute.class);
+      when(channel.attr(CLIENT_CERTIFICATE_CHAIN_VALIDATED_KEY)).thenReturn(chainValidatedAttr);
+      when(chainValidatedAttr.get()).thenReturn(chainValidated);
+    } else {
+      when(channel.attr(CLIENT_CERTIFICATE_CHAIN_VALIDATED_KEY)).thenReturn(null);
+    }
+
+    if (hostnames != null) {
+      Attribute<ImmutableList<String>> hostnamesAttr = mock(Attribute.class);
+      if (Boolean.TRUE.equals(chainValidated)) {
+        when(channel.attr(CLIENT_CERTIFICATE_HOSTNAMES_KEY)).thenReturn(hostnamesAttr);
+        when(hostnamesAttr.get()).thenReturn(hostnames);
+      } else {
+        lenient().when(channel.attr(CLIENT_CERTIFICATE_HOSTNAMES_KEY)).thenReturn(hostnamesAttr);
+        lenient().when(hostnamesAttr.get()).thenReturn(hostnames);
+      }
+    }
+
+    handler.channelActive(ctx);
+
+    when(channel.attr(REMOTE_ADDRESS_KEY)).thenReturn(remoteAddressAttr);
+    when(remoteAddressAttr.get()).thenReturn("192.168.1.1");
+    when(channel.attr(EppServiceHandler.CLIENT_CERTIFICATE_HASH_KEY)).thenReturn(certHashAttr);
+    when(certificate.getEncoded()).thenReturn(new byte[] {1, 2, 3});
+    when(localConnectionLimiter.acquireIp(any(String.class))).thenReturn(true);
+    when(idTokenSupplier.get()).thenReturn("fake_id_token");
+
+    ArgumentCaptor<FakeHttpServletRequest> requestCaptor =
+        ArgumentCaptor.forClass(FakeHttpServletRequest.class);
+    doAnswer(
+            invocation -> {
+              FakeHttpServletResponse rsp = invocation.getArgument(1);
+              rsp.getWriter().write("<epp><greeting/></epp>");
+              return null;
+            })
+        .when(requestHandler)
+        .handleRequest(requestCaptor.capture(), any(FakeHttpServletResponse.class));
+
+    certPromise.setSuccess(certificate);
+    return requestCaptor;
+  }
+
+  @Test
+  void testForwardsCertificateChainValidatedAndHostnamesHeaders() throws Exception {
+    ArgumentCaptor<FakeHttpServletRequest> requestCaptor =
+        setUpHandshakeWithChainAttrs(
+            true, ImmutableList.of("epp1.example.tld", "epp2.example.tld"));
+
+    String eppLoginXml = "<epp><command><login><clID>RegistrarA</clID></login></command></epp>";
+    handler.channelRead0(ctx, Unpooled.wrappedBuffer(eppLoginXml.getBytes(UTF_8)));
+
+    assertThat(requestCaptor.getAllValues()).hasSize(2);
+    for (FakeHttpServletRequest capturedRequest : requestCaptor.getAllValues()) {
+      assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_CHAIN_VALIDATED))
+          .isEqualTo("true");
+      assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES))
+          .isEqualTo("epp1.example.tld,epp2.example.tld");
+    }
+  }
+
+  @Test
+  void testOmitsCertificateHostnamesHeaderWhenEmpty() throws Exception {
+    ArgumentCaptor<FakeHttpServletRequest> requestCaptor =
+        setUpHandshakeWithChainAttrs(true, ImmutableList.of());
+
+    FakeHttpServletRequest capturedRequest = requestCaptor.getValue();
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_CHAIN_VALIDATED))
+        .isEqualTo("true");
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES)).isNull();
+  }
+
+  @Test
+  void testOmitsCertificateHostnamesHeaderWhenHostnamesAttrUnset() throws Exception {
+    ArgumentCaptor<FakeHttpServletRequest> requestCaptor = setUpHandshakeWithChainAttrs(true, null);
+
+    FakeHttpServletRequest capturedRequest = requestCaptor.getValue();
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_CHAIN_VALIDATED))
+        .isEqualTo("true");
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES)).isNull();
+  }
+
+  @Test
+  void testOmitsCertificateHostnamesHeaderWhenChainNotValidated() throws Exception {
+    ArgumentCaptor<FakeHttpServletRequest> requestCaptor =
+        setUpHandshakeWithChainAttrs(false, ImmutableList.of("epp.untrusted.tld"));
+
+    String eppLoginXml = "<epp><command><login><clID>RegistrarA</clID></login></command></epp>";
+    handler.channelRead0(ctx, Unpooled.wrappedBuffer(eppLoginXml.getBytes(UTF_8)));
+
+    assertThat(requestCaptor.getAllValues()).hasSize(2);
+    for (FakeHttpServletRequest capturedRequest : requestCaptor.getAllValues()) {
+      assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_CHAIN_VALIDATED))
+          .isEqualTo("false");
+      assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES)).isNull();
+    }
+  }
+
+  @Test
+  void testOmitsCertificateHostnamesHeaderWhenChainValidatedUnset() throws Exception {
+    ArgumentCaptor<FakeHttpServletRequest> requestCaptor =
+        setUpHandshakeWithChainAttrs(null, ImmutableList.of("epp.example.tld"));
+
+    FakeHttpServletRequest capturedRequest = requestCaptor.getValue();
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_CHAIN_VALIDATED)).isNull();
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES)).isNull();
+  }
+
+  @Test
+  void testOmitsCertificateChainHeadersWhenAttributesUnset() throws Exception {
+    when(idTokenSupplier.get()).thenReturn("fake_id_token");
+    ArgumentCaptor<FakeHttpServletRequest> requestCaptor =
+        ArgumentCaptor.forClass(FakeHttpServletRequest.class);
+    doAnswer(
+            invocation -> {
+              FakeHttpServletResponse rsp = invocation.getArgument(1);
+              rsp.getWriter().write("<epp><greeting/></epp>");
+              return null;
+            })
+        .when(requestHandler)
+        .handleRequest(requestCaptor.capture(), any(FakeHttpServletResponse.class));
+
+    setUpSuccessfulHandshake();
+
+    FakeHttpServletRequest capturedRequest = requestCaptor.getValue();
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_CHAIN_VALIDATED)).isNull();
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES)).isNull();
+  }
+
+  @Test
+  void testTruncatesOversizedCertificateHostnamesHeader() throws Exception {
+    ImmutableList<String> oversizedHostnames =
+        IntStream.range(0, 200)
+            .mapToObj(i -> String.format("epp-host-%03d.registrar.example.tld", i))
+            .collect(ImmutableList.toImmutableList());
+    ArgumentCaptor<FakeHttpServletRequest> requestCaptor =
+        setUpHandshakeWithChainAttrs(true, oversizedHostnames);
+
+    String eppLoginXml = "<epp><command><login><clID>RegistrarA</clID></login></command></epp>";
+    handler.channelRead0(ctx, Unpooled.wrappedBuffer(eppLoginXml.getBytes(UTF_8)));
+
+    assertThat(requestCaptor.getAllValues()).hasSize(2);
+    String expectedHeader =
+        requestCaptor.getAllValues().get(0).getHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES);
+    assertThat(expectedHeader).isNotNull();
+    assertThat(expectedHeader.length()).isAtMost(X509Utils.MAX_HOSTNAMES_HEADER_BYTES);
+    assertThat(expectedHeader).doesNotMatch("^,|,$");
+    assertThat(Splitter.on(',').splitToList(expectedHeader))
+        .isEqualTo(
+            oversizedHostnames.subList(0, Splitter.on(',').splitToList(expectedHeader).size()));
+    for (FakeHttpServletRequest capturedRequest : requestCaptor.getAllValues()) {
+      assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_CHAIN_VALIDATED))
+          .isEqualTo("true");
+      assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES))
+          .isEqualTo(expectedHeader);
+    }
+  }
+
+  @Test
+  void testOmitsCertificateHostnamesHeaderWhenSingleHostnameExceedsLimit() throws Exception {
+    ArgumentCaptor<FakeHttpServletRequest> requestCaptor =
+        setUpHandshakeWithChainAttrs(
+            true, ImmutableList.of("a".repeat(X509Utils.MAX_HOSTNAMES_HEADER_BYTES + 1)));
+
+    FakeHttpServletRequest capturedRequest = requestCaptor.getValue();
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_CHAIN_VALIDATED))
+        .isEqualTo("true");
+    assertThat(capturedRequest.getHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES)).isNull();
   }
 }

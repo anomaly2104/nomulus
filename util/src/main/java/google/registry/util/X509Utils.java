@@ -15,23 +15,35 @@
 package google.registry.util;
 
 import static com.google.common.base.MoreObjects.firstNonNull;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Throwables.throwIfInstanceOf;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.MoreCollectors.onlyElement;
 import static com.google.common.io.BaseEncoding.base64;
+import static google.registry.util.DomainNameUtils.canonicalizeAndValidateHostname;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.CharMatcher;
+import com.google.common.base.Suppliers;
+import com.google.common.base.Utf8;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.flogger.FluentLogger;
+import com.google.common.net.InternetDomainName;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
+import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.cert.CRLException;
 import java.security.cert.CRLReason;
+import java.security.cert.Certificate;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
@@ -41,15 +53,78 @@ import java.security.cert.X509CRL;
 import java.security.cert.X509CRLEntry;
 import java.security.cert.X509Certificate;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Date;
+import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.StringJoiner;
+import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import javax.annotation.Tainted;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
+import javax.security.auth.x500.X500Principal;
+import org.bouncycastle.asn1.ASN1String;
+import org.bouncycastle.asn1.x500.AttributeTypeAndValue;
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x500.style.BCStyle;
+import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.GeneralName;
 
 /** X.509 Public Key Infrastructure (PKI) helper functions. */
 public final class X509Utils {
+
+  private static final FluentLogger logger = FluentLogger.forEnclosingClass();
+
+  private static final int MAX_DNS_HOSTNAME_LENGTH = 253;
+
+  /**
+   * Maximum byte length of the {@link ProxyHttpHeaders#CERTIFICATE_HOSTNAMES} HTTP header value
+   * (leaving headroom below Jetty's 8 KB request header limit for cookies, OIDC bearer tokens, and
+   * other headers).
+   */
+  public static final int MAX_HOSTNAMES_HEADER_BYTES = 4096;
+
+  /**
+   * Maximum certificate chain length accepted for PKIX validation, matching OpenJDK's {@code
+   * jdk.tls.maxCertificateChainLength} default to bound CPU work on untrusted chains.
+   */
+  public static final int MAX_CERTIFICATE_CHAIN_LENGTH = 10;
+
+  private static final int MAX_FAILURE_REASON_LENGTH = 512;
+
+  private static final String UNKNOWN_AUTH_TYPE = "UNKNOWN";
+
+  private static final Supplier<X509TrustManager> DEFAULT_TRUST_MANAGER =
+      Suppliers.memoize(X509Utils::loadDefaultTrustManager);
+
+  /** Result of validating a client TLS certificate chain against trusted root CAs. */
+  public record CertificateChainValidationResult(Optional<String> failureReason) {
+
+    private static final CertificateChainValidationResult VALID =
+        new CertificateChainValidationResult(Optional.empty());
+
+    public CertificateChainValidationResult {
+      checkNotNull(failureReason, "failureReason");
+      failureReason.ifPresent(
+          reason -> checkArgument(!reason.isBlank(), "failureReason must not be blank"));
+    }
+
+    public boolean valid() {
+      return failureReason.isEmpty();
+    }
+
+    public static CertificateChainValidationResult ok() {
+      return VALID;
+    }
+
+    public static CertificateChainValidationResult failed(String failureReason) {
+      return new CertificateChainValidationResult(Optional.of(failureReason));
+    }
+  }
 
   /**
    * Parse the encoded certificate and return a base64 encoded string (without padding) of the
@@ -196,6 +271,232 @@ public final class X509Utils {
   public static String encodeX509Certificate(X509Certificate certificate)
       throws CertificateEncodingException {
     return Base64.getEncoder().encodeToString(certificate.getEncoded());
+  }
+
+  /**
+   * Returns a PKIX {@link X509TrustManager} initialized with the JVM's default truststore (loaded
+   * once and memoized).
+   */
+  public static X509TrustManager getDefaultTrustManager() {
+    return DEFAULT_TRUST_MANAGER.get();
+  }
+
+  private static X509TrustManager loadDefaultTrustManager() {
+    try {
+      // OpenJDK PKIX disables online CRL/OCSP revocation checking by default when
+      // com.sun.net.ssl.checkRevocation is unset/false; keep it disabled so chain validation never
+      // performs blocking network I/O on the Netty EventLoop.
+      TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance("PKIX");
+      trustManagerFactory.init((KeyStore) null);
+      return Arrays.stream(trustManagerFactory.getTrustManagers())
+          .filter(X509TrustManager.class::isInstance)
+          .map(X509TrustManager.class::cast)
+          .findFirst()
+          .orElseThrow(() -> new IllegalStateException("No X509TrustManager found"));
+    } catch (GeneralSecurityException e) {
+      throw new IllegalStateException("Failed to initialize default PKIX X509TrustManager", e);
+    }
+  }
+
+  /**
+   * Validates the client TLS certificate chain against the given {@link X509TrustManager}.
+   *
+   * <p>Validates all chains via {@link X509TrustManager#checkServerTrusted} (with authType {@code
+   * "UNKNOWN"}) so publicly trusted TLS certificates (including {@code serverAuth}-only leaves such
+   * as Let's Encrypt post-2026-07-08, dual-EKU, {@code anyExtendedKeyUsage}, and no-EKU leaves) are
+   * accepted under CA/B Forum TLS Baseline Requirements while enforcing OpenJDK's {@code TLSServer}
+   * CA-distrust policies and SHA-1 constraints and rejecting {@code clientAuth}-only and non-TLS
+   * EKUs. Never throws.
+   */
+  public static CertificateChainValidationResult validateCertificateChain(
+      @Nullable Certificate[] peerCertificates, @Nullable X509TrustManager trustManager) {
+    if (peerCertificates == null || peerCertificates.length == 0) {
+      return CertificateChainValidationResult.failed("No peer certificates presented");
+    }
+    if (trustManager == null) {
+      return CertificateChainValidationResult.failed("Trust manager is not configured");
+    }
+    if (peerCertificates.length > MAX_CERTIFICATE_CHAIN_LENGTH) {
+      return CertificateChainValidationResult.failed(
+          String.format(
+              "Certificate chain length %d exceeds maximum of %d",
+              peerCertificates.length, MAX_CERTIFICATE_CHAIN_LENGTH));
+    }
+    if (!(peerCertificates[0] instanceof X509Certificate leafCert)) {
+      return CertificateChainValidationResult.failed("Leaf certificate is not an X509Certificate");
+    }
+    X509Certificate[] x509Chain =
+        Arrays.stream(peerCertificates)
+            .filter(X509Certificate.class::isInstance)
+            .map(X509Certificate.class::cast)
+            .toArray(X509Certificate[]::new);
+    try {
+      if (leafCert.getBasicConstraints() != -1) {
+        return CertificateChainValidationResult.failed("Leaf certificate must not be a CA");
+      }
+      // Explicitly check leaf dates (PKIX builds a 0-length path if the leaf is a trust anchor).
+      leafCert.checkValidity();
+      trustManager.checkServerTrusted(x509Chain, UNKNOWN_AUTH_TYPE);
+      return CertificateChainValidationResult.ok();
+    } catch (CertificateException | RuntimeException e) {
+      String reason = formatValidationFailureReason(e);
+      logger.atFine().withCause(e).log("Certificate chain validation did not succeed: %s", reason);
+      return CertificateChainValidationResult.failed(reason);
+    }
+  }
+
+  private static String formatValidationFailureReason(Throwable e) {
+    String className = e.getClass().getSimpleName();
+    if (className.isEmpty()) {
+      className = e.getClass().getName();
+    }
+    String rawMessage = e.getMessage();
+    if (rawMessage == null) {
+      return className;
+    }
+    String sanitized = CharMatcher.javaIsoControl().replaceFrom(rawMessage, ' ').trim();
+    if (sanitized.isEmpty()) {
+      return className;
+    }
+    String full = className + ": " + sanitized;
+    return full.length() > MAX_FAILURE_REASON_LENGTH
+        ? full.substring(0, MAX_FAILURE_REASON_LENGTH - 3) + "..."
+        : full;
+  }
+
+  /**
+   * Extracts canonicalized, deduplicated DNS hostnames (including single-label wildcards per RFC
+   * 9525 section 6.3, rejecting wildcards over public suffixes) from the certificate's Subject
+   * Alternative Names, or falls back to the Subject Common Name (CN) only when no SAN extension is
+   * present.
+   */
+  public static ImmutableList<String> extractHostnames(X509Certificate certificate) {
+    checkNotNull(certificate, "certificate");
+    Collection<List<?>> sanEntries;
+    boolean hasSanExtension;
+    try {
+      sanEntries = certificate.getSubjectAlternativeNames();
+      // Per RFC 9525 section 6.2, never fall back to CN when a SAN extension is present (including
+      // a degenerate empty-SEQUENCE SAN extension).
+      hasSanExtension =
+          certificate.getExtensionValue(Extension.subjectAlternativeName.getId()) != null
+              || (sanEntries != null && !sanEntries.isEmpty());
+    } catch (CertificateParsingException | RuntimeException e) {
+      logger.atWarning().withCause(e).log(
+          "Failed to parse Subject Alternative Names from certificate.");
+      return ImmutableList.of();
+    }
+    ImmutableList<String> rawNames =
+        hasSanExtension ? extractDnsSans(sanEntries) : extractCommonNames(certificate);
+    return rawNames.stream()
+        .map(X509Utils::normalizeCertificateHostname)
+        .flatMap(Optional::stream)
+        .distinct()
+        .collect(toImmutableList());
+  }
+
+  private static ImmutableList<String> extractDnsSans(@Nullable Collection<List<?>> sanEntries) {
+    if (sanEntries == null) {
+      return ImmutableList.of();
+    }
+    return sanEntries.stream()
+        .filter(
+            entry ->
+                entry != null
+                    && entry.size() >= 2
+                    && Integer.valueOf(GeneralName.dNSName).equals(entry.get(0))
+                    && entry.get(1) instanceof String)
+        .map(entry -> (String) entry.get(1))
+        .collect(toImmutableList());
+  }
+
+  private static ImmutableList<String> extractCommonNames(X509Certificate certificate) {
+    try {
+      X500Principal principal = certificate.getSubjectX500Principal();
+      if (principal == null) {
+        return ImmutableList.of();
+      }
+      X500Name subject = X500Name.getInstance(principal.getEncoded());
+      if (subject == null) {
+        return ImmutableList.of();
+      }
+      return Arrays.stream(subject.getRDNs(BCStyle.CN))
+          .flatMap(rdn -> Arrays.stream(rdn.getTypesAndValues()))
+          .filter(atv -> BCStyle.CN.equals(atv.getType()))
+          .map(AttributeTypeAndValue::getValue)
+          .filter(ASN1String.class::isInstance)
+          .map(value -> ((ASN1String) value).getString())
+          .collect(toImmutableList());
+    } catch (RuntimeException e) {
+      logger.atWarning().withCause(e).log("Failed to parse Subject Common Name from certificate.");
+      return ImmutableList.of();
+    }
+  }
+
+  /**
+   * Formats extracted hostnames as a comma-separated HTTP header value bounded to {@link
+   * #MAX_HOSTNAMES_HEADER_BYTES} bytes, truncating only on whole-hostname boundaries. Returns
+   * {@code null} if {@code hostnames} is null, empty, or no hostname fits within the limit.
+   */
+  @Nullable
+  public static String formatHostnamesHeader(
+      @Nullable ImmutableList<String> hostnames, @Nullable String certificateHash) {
+    return formatHostnamesHeader(hostnames, MAX_HOSTNAMES_HEADER_BYTES, certificateHash);
+  }
+
+  @VisibleForTesting
+  @Nullable
+  static String formatHostnamesHeader(
+      @Nullable ImmutableList<String> hostnames, int maxBytes, @Nullable String certificateHash) {
+    checkArgument(maxBytes > 0, "maxBytes must be positive");
+    if (hostnames == null || hostnames.isEmpty()) {
+      return null;
+    }
+    ImmutableList<String> nonBlankHostnames =
+        hostnames.stream().filter(hostname -> !hostname.isBlank()).collect(toImmutableList());
+    if (nonBlankHostnames.isEmpty()) {
+      return null;
+    }
+    StringJoiner joiner = new StringJoiner(",");
+    int currentBytes = 0;
+    int includedCount = 0;
+    for (String hostname : nonBlankHostnames) {
+      int additionalBytes = (includedCount == 0 ? 0 : 1) + Utf8.encodedLength(hostname);
+      if (additionalBytes > maxBytes - currentBytes) {
+        logger.atWarning().log(
+            "Client certificate (hash=%s) has %d hostnames; truncating %s header to %d hostnames"
+                + " (<= %d bytes).",
+            firstNonNull(certificateHash, "unknown"),
+            nonBlankHostnames.size(),
+            ProxyHttpHeaders.CERTIFICATE_HOSTNAMES,
+            includedCount,
+            maxBytes);
+        break;
+      }
+      joiner.add(hostname);
+      currentBytes += additionalBytes;
+      includedCount++;
+    }
+    return includedCount == 0 ? null : joiner.toString();
+  }
+
+  private static Optional<String> normalizeCertificateHostname(String raw) {
+    if (raw == null || raw.isEmpty()) {
+      return Optional.empty();
+    }
+    boolean isWildcard = raw.startsWith("*.");
+    String candidate = isWildcard ? raw.substring(2) : raw;
+    try {
+      String normalized = canonicalizeAndValidateHostname(candidate);
+      if (isWildcard
+          && (normalized.length() + 2 > MAX_DNS_HOSTNAME_LENGTH
+              || InternetDomainName.from(normalized).isPublicSuffix())) {
+        return Optional.empty();
+      }
+      return Optional.of(isWildcard ? "*." + normalized : normalized);
+    } catch (IllegalArgumentException e) {
+      return Optional.empty();
+    }
   }
 
   private X509Utils() {}

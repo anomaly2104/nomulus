@@ -23,6 +23,21 @@ public final class ProxyHttpHeaders {
   public static final String CERTIFICATE_HASH = "X-SSL-Certificate";
 
   /**
+   * HTTP header name used to pass whether the client TLS certificate chain validated against the
+   * trusted root CAs ("true" or "false").
+   */
+  public static final String CERTIFICATE_CHAIN_VALIDATED = "X-SSL-Certificate-Chain-Validated";
+
+  /**
+   * HTTP header name used to pass the comma-separated, canonicalized, deduplicated DNS hostnames
+   * (including single-label wildcards) extracted from a validated client TLS certificate's Subject
+   * Alternative Names (or Subject CN when no SAN extension is present). Only emitted when chain
+   * validation succeeds and truncated on whole-hostname boundaries to at most {@link
+   * X509Utils#MAX_HOSTNAMES_HEADER_BYTES} bytes.
+   */
+  public static final String CERTIFICATE_HOSTNAMES = "X-SSL-Certificate-Hostnames";
+
+  /**
    * HTTP header name passed from Nomulus to proxy to indicate that an EPP session should be closed.
    */
   public static final String EPP_SESSION = "Epp-Session";

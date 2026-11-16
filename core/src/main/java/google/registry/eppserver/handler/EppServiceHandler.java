@@ -14,10 +14,13 @@
 
 package google.registry.eppserver.handler;
 
+import static google.registry.networking.handler.SslServerInitializer.CLIENT_CERTIFICATE_CHAIN_VALIDATED_KEY;
+import static google.registry.networking.handler.SslServerInitializer.CLIENT_CERTIFICATE_HOSTNAMES_KEY;
 import static google.registry.networking.handler.SslServerInitializer.CLIENT_CERTIFICATE_PROMISE_KEY;
 import static google.registry.util.GcpJsonFormatter.setCurrentRequest;
 import static google.registry.util.GcpJsonFormatter.setCurrentTraceId;
 import static google.registry.util.GcpJsonFormatter.unsetCurrentRequest;
+import static google.registry.util.X509Utils.formatHostnamesHeader;
 import static google.registry.util.X509Utils.getCertificateHash;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
@@ -38,6 +41,7 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.Promise;
@@ -52,6 +56,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.annotation.Nullable;
 
 /**
  * Unified processor for EPP protocol traffic.
@@ -82,6 +87,8 @@ public class EppServiceHandler extends SimpleChannelInboundHandler<ByteBuf> {
   private final int preLoginReadTimeoutSeconds;
 
   private String sslClientCertificateHash;
+  @Nullable private Boolean sslClientCertificateChainValidated;
+  @Nullable private String sslClientCertificateHostnamesHeader;
   private String clientAddress;
   private String registrarId; // The clID extracted from login
   private String authenticatedRegistrarId; // The verified registrar ID after successful login
@@ -149,6 +156,13 @@ public class EppServiceHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     sslClientCertificateHash = getCertificateHash(cert);
     ctx.channel().attr(CLIENT_CERTIFICATE_HASH_KEY).set(sslClientCertificateHash);
+    sslClientCertificateChainValidated =
+        getChannelAttr(ctx, CLIENT_CERTIFICATE_CHAIN_VALIDATED_KEY);
+    sslClientCertificateHostnamesHeader =
+        Boolean.TRUE.equals(sslClientCertificateChainValidated)
+            ? formatHostnamesHeader(
+                getChannelAttr(ctx, CLIENT_CERTIFICATE_HOSTNAMES_KEY), sslClientCertificateHash)
+            : null;
 
     // 1. Connection throttling (IP only pre-login)
     if (!localConnectionLimiter.acquireIp(clientAddress)) {
@@ -236,11 +250,25 @@ public class EppServiceHandler extends SimpleChannelInboundHandler<ByteBuf> {
     return true;
   }
 
+  @Nullable
+  private static <T> T getChannelAttr(ChannelHandlerContext ctx, AttributeKey<T> key) {
+    Attribute<T> attr = ctx.channel().attr(key);
+    return attr != null ? attr.get() : null;
+  }
+
   private FakeHttpServletRequest buildServletRequest(String xml) {
     FakeHttpServletRequest req = new FakeHttpServletRequest();
     req.setRequestUri("/_dr/epp");
     req.setBody(xml.getBytes(UTF_8));
     req.setHeader(ProxyHttpHeaders.CERTIFICATE_HASH, sslClientCertificateHash);
+    if (sslClientCertificateChainValidated != null) {
+      req.setHeader(
+          ProxyHttpHeaders.CERTIFICATE_CHAIN_VALIDATED,
+          sslClientCertificateChainValidated.toString());
+    }
+    if (sslClientCertificateHostnamesHeader != null) {
+      req.setHeader(ProxyHttpHeaders.CERTIFICATE_HOSTNAMES, sslClientCertificateHostnamesHeader);
+    }
     req.setHeader(ProxyHttpHeaders.IP_ADDRESS, clientAddress);
     if (registrarId != null) {
       req.setHeader(ProxyHttpHeaders.REGISTRAR_ID, registrarId);
